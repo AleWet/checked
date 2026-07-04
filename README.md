@@ -29,14 +29,17 @@ pip install -r requirements.txt
 The first time you run a transcription, `faster-whisper` will download the chosen model
 (e.g. ~250MB for "small") to a local cache — no ongoing cost, runs on CPU.
 
-## 3. Add your API key
+## 3. Add your API key(s)
 
 ```bash
 cp .env.example .env
-# edit .env and paste your Anthropic API key
+# edit .env and paste your key(s) — you only need the key for the provider(s) you plan to use
 ```
 
-Get a key at https://console.anthropic.com if you don't have one yet.
+Get keys at:
+- Anthropic (Claude): https://console.anthropic.com
+- OpenAI: https://platform.openai.com/api-keys
+- Perplexity: https://www.perplexity.ai/settings/api
 
 ## 4. Run it
 
@@ -44,17 +47,30 @@ Get a key at https://console.anthropic.com if you don't have one yet.
 python fact_check.py "https://www.tiktok.com/@someuser/video/1234567890"
 ```
 
+Choose which AI provider does the fact-checking with `--provider`:
+
+```bash
+python fact_check.py "<url>" --provider claude       # default — web search tool, sends frames as images
+python fact_check.py "<url>" --provider openai       # uses OpenAI's Responses API + web_search tool, sends frames as images
+python fact_check.py "<url>" --provider perplexity   # Sonar models — web search is built into the model itself, text-only (no frames sent)
+```
+
+Each provider defaults to a specific model (`claude-haiku-4-5-20251001`, `gpt-5.5`, `sonar-pro` respectively) — override with `--model` if you want to try a different one within that provider, e.g. `--provider openai --model gpt-5.4-mini`.
+
+Note: Perplexity's Sonar models don't take image input through their API the way Claude and OpenAI do, so when you pick `--provider perplexity`, frame extraction is skipped automatically (transcript + metadata only) — you don't need to also pass `--no-frames`.
+
 Optional flags:
 
 ```bash
 python fact_check.py "<url>" \
-  --frames 6 \                  # how many still frames to sample (default 6, 0 disables visuals via --no-frames)
+  --provider claude \
+  --frames 6 \                  # how many still frames to sample (default 6)
+  --no-frames \                 # or --no-images — skip images entirely for any provider, cheapest option
   --whisper-model small \       # tiny/base/small/medium — bigger = more accurate, slower
-  --model claude-sonnet-5 \     # the fact-checking model
   --output-dir ./reports
 ```
 
-A Markdown + JSON report is saved to `./reports/` and printed to the terminal.
+A Markdown + JSON report is saved to `./reports/` and printed to the terminal. Every run also appends a line to `./reports/usage_log.jsonl` with token counts per provider/model, so you can compare cost across providers directly.
 
 ## Design notes / why these choices
 
