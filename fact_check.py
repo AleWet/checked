@@ -34,7 +34,7 @@ load_dotenv(override=True)
 DEFAULT_MODELS = {
     "claude": "claude-haiku-4-5-20251001",
     "openai": "gpt-5.5",
-    "perplexity": "sonar-pro",
+    "perplexity": "sonar",
 }
 
 
@@ -159,32 +159,113 @@ def image_to_block(path: Path) -> dict:
 # Step 4: Fact-check via Claude
 # --------------------------------------------------------------------------
 
-FACT_CHECK_SYSTEM_PROMPT = """You are a rigorous, impartial fact-checking analyst reviewing short-form \
-video content (reels, TikToks, YouTube Shorts). You will receive the video's transcript, its \
-platform metadata (title, caption/description, uploader, upload date), and a small number of \
-sample frames.
+BASE_CHECK_SYSTEM_PROMPT = """You are a fact-checking engine for short-form video content.
 
-Your job:
-1. Identify the distinct, checkable factual claims made in the video (ignore pure opinion, jokes, \
-or subjective takes — flag them as such rather than fact-checking them).
-2. For each claim, use web search to verify it against credible, current sources. Prefer primary \
-sources, official data, and established outlets over blogs, forums, or SEO content.
-3. Rate each claim: True / Mostly True / Misleading / Mostly False / False / Unverifiable.
-4. Give an overall verdict for the video plus a short confidence note (e.g. "high confidence" vs \
-"limited evidence available").
-5. Be skeptical of unsupported claims, but do not assume malicious intent — misinformation is often \
-unintentional or a matter of missing context.
-6. If the transcript is too short, garbled, or ambiguous to extract real claims, say so plainly \
-instead of inventing a verdict.
+INPUT: transcript, platform metadata (title, caption, uploader, date), sample frames.
 
-Output format (Markdown). Be as efficient as you can, write only the essential words:
-## Overall Verdict
-## Claim-by-Claim Breakdown
-(for each: the claim, verdict, Exact URL of the web sources)
-## Missing Context / Caveats
+TASK:
+- Extract the 3 most checkable factual claims. Skip opinions, jokes, subjective takes.
+- Verify each claim via web search. Prefer primary sources and established outlets.
+- If transcript is too short or ambiguous to extract real claims, return reliability_score: null and explain in one sentence.
 
-Always cite the sources you actually used. Do not fabricate URLs or citations."""
+OUTPUT: valid JSON only, no markdown, no commentary.
 
+{
+  "reliability_score": <integer 0-100>,
+  "claims": [
+    {
+      "claim": "<exact claim as stated>",
+      "verdict": "true" | "mostly_true" | "uncertain" | "mostly_false" | "false",
+      "sources": ["<exact URL>", "<exact URL>"]
+    }
+  ]
+}
+
+Rules:
+- reliability_score is the weighted average of claim verdicts (true=100, mostly_true=75, uncertain=50, mostly_false=25, false=0).
+- Never fabricate URLs. If no source found, set verdict to "uncertain" and sources to [].
+- Output nothing except the JSON object."""
+
+PREMIUM_CHECK_SYSTEM_PROMPT = """You are a senior fact-checking analyst specialising in short-form video content
+(Reels, TikToks, YouTube Shorts). You receive: full transcript, platform metadata
+(title, caption, uploader, upload date, view count if available), and sample frames.
+
+ANALYSIS PIPELINE:
+
+STEP 1 — CLAIM EXTRACTION
+Identify up to 5 distinct, checkable factual claims. For each, note:
+- The exact quote or close paraphrase as stated in the video
+- Timestamp or position (early / mid / late)
+- Claim type: statistic | causal | historical | scientific | political | attribution
+- Checkability score: 1-10 (10 = fully checkable, 1 = too vague to verify)
+Ignore pure opinions, predictions, jokes. Flag them in a separate "non-claims" list.
+
+STEP 2 — VERIFICATION
+For each claim with checkability ≥ 4:
+- Search for primary sources: government data, peer-reviewed studies, official reports
+- Search for established outlets: Reuters, AP, BBC, NYT, peer-reviewed journals
+- Note source publication date — flag if source is older than 2 years
+- Note any expert consensus or dissent on the topic
+- Identify what context the video omits that materially changes the claim's meaning
+
+STEP 3 — VERDICT ASSIGNMENT
+Rate each claim on this exact scale:
+- TRUE (90-100): supported by multiple primary sources, no significant caveats
+- MOSTLY_TRUE (70-89): supported but missing nuance or minor context
+- UNCERTAIN (40-69): conflicting evidence or insufficient primary sources found
+- MOSTLY_FALSE (15-39): contradicted by primary sources with limited supporting evidence
+- FALSE (0-14): directly contradicted by multiple primary sources
+
+STEP 4 — CONFIDENCE RATING
+Rate your own confidence in the verdict:
+- HIGH: multiple primary sources found, clear consensus
+- MEDIUM: some sources found, limited consensus or dated data
+- LOW: minimal sources found, topic contested or niche
+
+OUTPUT: valid JSON only. No markdown, no commentary outside the JSON.
+
+{
+  "reliability_score": <integer 0-100>,
+  "confidence": "high" | "medium" | "low",
+  "content_summary": "<one sentence describing what the video claims overall>",
+  "verdict_summary": "<two sentences max: overall assessment and single most important finding>",
+  "claims": [
+    {
+      "id": 1,
+      "claim": "<exact quote or close paraphrase>",
+      "claim_type": "statistic|causal|historical|scientific|political|attribution",
+      "position": "early|mid|late",
+      "checkability": <1-10>,
+      "verdict": "true|mostly_true|uncertain|mostly_false|false",
+      "verdict_score": <0-100>,
+      "explanation": "<two sentences max: what sources say and what context is missing>",
+      "source_date_flag": true | false,
+      "sources": [
+        {
+          "title": "<article or page title>",
+          "outlet": "<publication name>",
+          "url": "<exact URL>",
+          "date": "<publication date if available>"
+        }
+      ]
+    }
+  ],
+  "non_claims": ["<opinion or joke flagged, one line each>"],
+  "missing_context": "<three sentences max: what the video omits that materially changes its meaning>",
+  "red_flags": ["<specific manipulative framing, cherry-picked stat, or missing attribution if detected>"]
+}
+
+RULES:
+- reliability_score = weighted average of verdict_scores, weighted by checkability.
+- Never fabricate URLs. If no source found, set verdict to "uncertain", sources to [].
+- source_date_flag = true if best available source is older than 2 years.
+- red_flags is an empty array [] if none detected — never omit the field.
+- Output nothing except the JSON object. No preamble, no closing note."""
+
+TIER_PROMPTS = {
+    "base": BASE_CHECK_SYSTEM_PROMPT,
+    "premium": PREMIUM_CHECK_SYSTEM_PROMPT,
+}
 
 def build_transcript_block(metadata: dict, transcript: str, frame_paths: list[Path]) -> str:
     return f"""Video metadata:
@@ -214,7 +295,7 @@ def image_to_block(path: Path) -> dict:
     }
 
 
-def call_claude(metadata: dict, transcript: str, frame_paths: list[Path], model: str) -> tuple[str, dict]:
+def call_claude(metadata: dict, transcript: str, frame_paths: list[Path], model: str, system_prompt: str) -> tuple[str, dict]:
     import anthropic
 
     client = anthropic.Anthropic()  # reads ANTHROPIC_API_KEY from env
@@ -226,7 +307,7 @@ def call_claude(metadata: dict, transcript: str, frame_paths: list[Path], model:
     response = client.messages.create(
         model=model,
         max_tokens=3000,
-        system=FACT_CHECK_SYSTEM_PROMPT,
+        system=system_prompt,
         tools=[{"type": "web_search_20250305", "name": "web_search", "max_uses": 8}],
         messages=[{"role": "user", "content": content}],
     )
@@ -245,7 +326,7 @@ def call_claude(metadata: dict, transcript: str, frame_paths: list[Path], model:
 
 # ---- OpenAI -----------------------------------------------------------------
 
-def call_openai(metadata: dict, transcript: str, frame_paths: list[Path], model: str) -> tuple[str, dict]:
+def call_openai(metadata: dict, transcript: str, frame_paths: list[Path], model: str, system_prompt: str) -> tuple[str, dict]:
     from openai import OpenAI
 
     client = OpenAI()  # reads OPENAI_API_KEY from env
@@ -257,7 +338,7 @@ def call_openai(metadata: dict, transcript: str, frame_paths: list[Path], model:
 
     response = client.responses.create(
         model=model,
-        instructions=FACT_CHECK_SYSTEM_PROMPT,
+        instructions=system_prompt,
         tools=[{"type": "web_search"}],
         input=[{"role": "user", "content": content}],
     )
@@ -275,7 +356,7 @@ def call_openai(metadata: dict, transcript: str, frame_paths: list[Path], model:
 
 # ---- Perplexity --------------------------------------------------------------
 
-def call_perplexity(metadata: dict, transcript: str, frame_paths: list[Path], model: str) -> tuple[str, dict]:
+def call_perplexity(metadata: dict, transcript: str, frame_paths: list[Path], model: str, system_prompt: str) -> tuple[str, dict]:
     from openai import OpenAI  # Perplexity's Sonar API is OpenAI-chat-completions-compatible
 
     client = OpenAI(api_key=os.environ["PERPLEXITY_API_KEY"], base_url="https://api.perplexity.ai")
@@ -283,7 +364,7 @@ def call_perplexity(metadata: dict, transcript: str, frame_paths: list[Path], mo
     completion = client.chat.completions.create(
         model=model,  # e.g. "sonar", "sonar-pro", "sonar-reasoning-pro" — web search is built-in, no tool config needed
         messages=[
-            {"role": "system", "content": FACT_CHECK_SYSTEM_PROMPT},
+            {"role": "system", "content": system_prompt},
             {"role": "user", "content": build_transcript_block(metadata, transcript, [])},
         ],
     )
@@ -301,23 +382,24 @@ def call_perplexity(metadata: dict, transcript: str, frame_paths: list[Path], mo
     return report_text, usage_dict
 
 
-def call_fact_checker(provider: str, metadata: dict, transcript: str, frame_paths: list[Path], model: str) -> tuple[str, dict]:
+def call_fact_checker(provider: str, metadata: dict, transcript: str, frame_paths: list[Path], model: str, system_prompt: str) -> tuple[str, dict]:
     if provider == "claude":
-        return call_claude(metadata, transcript, frame_paths, model)
+        return call_claude(metadata, transcript, frame_paths, model, system_prompt)
     elif provider == "openai":
-        return call_openai(metadata, transcript, frame_paths, model)
+        return call_openai(metadata, transcript, frame_paths, model, system_prompt)
     elif provider == "perplexity":
-        return call_perplexity(metadata, transcript, frame_paths, model)
+        return call_perplexity(metadata, transcript, frame_paths, model, system_prompt)
     else:
         raise ValueError(f"Unknown provider: {provider}")
 
 
-def log_usage(usage: dict, provider: str, model: str, log_path: Path) -> None:
+def log_usage(usage: dict, provider: str, model: str, tier: str, log_path: Path) -> None:
     """Append one line per run to a local usage log, so cost is trackable over time."""
     entry = {
         "timestamp": datetime.now(timezone.utc).isoformat(),
         "provider": provider,
         "model": model,
+        "tier": tier,
         **usage,
     }
     with open(log_path, "a") as f:
@@ -369,6 +451,8 @@ def main():
                          help="Which AI provider to use for the fact-check step (default claude)")
     parser.add_argument("--model", default=None,
                          help=f"Model id to use. Defaults per provider: {DEFAULT_MODELS}")
+    parser.add_argument("--tier", choices=["base", "premium"], default="base",
+                         help="Which system prompt tier to use (default base). 'premium' is currently a placeholder, identical to base.")
     parser.add_argument("--output-dir", default="./reports", help="Where to save reports")
     parser.add_argument("--keep-temp", action="store_true", help="Keep downloaded media/frames instead of deleting")
     parser.add_argument("--cookies", default=None, help="Path to a Netscape-format cookies.txt (needed for Instagram)")
@@ -414,11 +498,12 @@ def main():
             frame_paths = extract_frames(metadata["video_path"], metadata["duration"], workdir, args.frames)
             print(f"      -> {len(frame_paths)} frames extracted")
 
-        print(f"[5/5] Sending to {args.provider} ({model}) with web search enabled...")
-        report_text, usage = call_fact_checker(args.provider, metadata, transcript, frame_paths, model)
+        print(f"[5/5] Sending to {args.provider} ({model}, tier={args.tier}) with web search enabled...")
+        system_prompt = TIER_PROMPTS[args.tier]
+        report_text, usage = call_fact_checker(args.provider, metadata, transcript, frame_paths, model, system_prompt)
         search_note = f"{usage['web_search_requests']} web searches" if usage["web_search_requests"] is not None else "search count n/a"
         print(f"      -> tokens: {usage['input_tokens']} in / {usage['output_tokens']} out ({search_note})")
-        log_usage(usage, args.provider, model, Path(args.output_dir) / "usage_log.jsonl")
+        log_usage(usage, args.provider, model, args.tier, Path(args.output_dir) / "usage_log.jsonl")
 
         report_path = save_report(metadata, transcript, report_text, Path(args.output_dir))
 
