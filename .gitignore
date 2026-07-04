@@ -1,0 +1,5 @@
+env
+*.env
+cookies*.txt
+reports/
+venv/
